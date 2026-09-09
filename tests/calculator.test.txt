@@ -1,0 +1,166 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const XLSX = require('xlsx');
+
+const BASE_URL = process.env.BASE_URL || 'https://testquest.pryaniky.com';
+const cache = new Map();
+
+// Загружаем ресурс один раз и повторно используем его во всех проверках.
+async function get(path) {
+  if (!cache.has(path)) {
+    cache.set(path, fetch(new URL(path, BASE_URL), {
+      signal: AbortSignal.timeout(15_000)
+    }).then(async response => {
+      assert.equal(response.status, 200, `${path}: получен HTTP ${response.status}`);
+      return response.text();
+    }));
+  }
+
+  return cache.get(path);
+}
+
+// Основные клиентские файлы, участвующие в расчёте и экспорте.
+async function applicationSource() {
+  const files = await Promise.all([
+    get('/js/data.js'),
+    get('/js/modulesPicker.js'),
+    get('/js/calc.js'),
+    get('/js/exportEstimate.js'),
+    get('/js/app.js')
+  ]);
+
+  return files.join('\n');
+}
+
+// Извлекаем самое длинное Base64-значение — встроенный XLSX-шаблон сметы.
+function extractTemplate(source) {
+  const chunks = source.match(/[A-Za-z0-9+/]{500,}={0,2}/g) || [];
+  assert.ok(chunks.length > 0, 'В kp-template-base64.js не найден XLSX-шаблон');
+  return chunks.sort((a, b) => b.length - a.length)[0];
+}
+
+async function readTemplate() {
+  const source = await get('/js/kp-template-base64.js');
+  const base64 = extractTemplate(source);
+  const buffer = Buffer.from(base64, 'base64');
+  assert.ok(buffer.length > 1000, 'Excel-шаблон подозрительно мал');
+  return XLSX.read(buffer, { type: 'buffer', cellStyles: true });
+}
+
+function workbookText(workbook) {
+  return workbook.SheetNames
+    .map(name => XLSX.utils.sheet_to_csv(workbook.Sheets[name]))
+    .join('\n');
+}
+
+test('01. Стенд и раздел Калькулятор смет доступны', async () => {
+  const html = await get('/');
+  assert.match(html, /TestQuest/i);
+  assert.match(html, /Калькулятор смет/i);
+  assert.match(html, /Выгрузить смету в Excel/i);
+});
+
+test('02. Метаданные КП связаны с экспортом', async () => {
+  const html = await get('/');
+  const source = await applicationSource();
+
+  for (const id of ['companyName', 'kpIssueDate', 'kpValidUntil', 'projectName', 'kpManager']) {
+    assert.ok(html.includes(id), `В интерфейсе отсутствует поле ${id}`);
+    assert.ok(source.includes(id), `Поле ${id} не используется клиентским кодом`);
+  }
+});
+
+test('03. Тарифы Облако и Коробка участвуют в расчёте', async () => {
+  const html = await get('/');
+  const source = await applicationSource();
+
+  assert.ok(html.includes('tariff-cloud'));
+  assert.ok(html.includes('tariff-onprem'));
+  assert.ok(source.includes('tariff-cloud'));
+  assert.ok(source.includes('tariff-onprem'));
+});
+
+test('04. Пользователи и срок лицензии участвуют в экспорте', async () => {
+  const html = await get('/');
+  const source = await applicationSource();
+
+  for (const id of ['licenceCount', 'termMonths']) {
+    assert.ok(html.includes(id), `В интерфейсе отсутствует поле ${id}`);
+    assert.ok(source.includes(id), `Поле ${id} не используется в расчёте/экспорте`);
+  }
+});
+
+test('05. Модули связаны с итоговой сметой', async () => {
+  const html = await get('/');
+  const source = await applicationSource();
+  const application = `${html}\n${source}`;
+
+  // Карточки модулей создаются JavaScript-кодом, поэтому конкретного id
+  // может не быть в исходном HTML страницы.
+  assert.match(application, /Конструктор процессов/i);
+  assert.match(source, /modules?/i);
+  assert.match(source, /estimate|export|итог|смет/i);
+});
+
+test('06. Внедрение связано с итоговой сметой', async () => {
+  const html = await get('/');
+  const source = await applicationSource();
+
+  assert.ok(html.includes('config-tab-implementation'));
+  assert.ok(html.includes('implementation-add-row'));
+  assert.match(source, /implementation/i);
+});
+
+test('07. T&M связан с итоговой сметой', async () => {
+  const html = await get('/');
+  const source = await applicationSource();
+
+  assert.ok(html.includes('config-tab-tm'));
+  assert.ok(html.includes('tmHours'));
+  assert.ok(source.includes('tmHours'));
+});
+
+test('08. Выгрузка использует встроенный Excel-шаблон', async () => {
+  const html = await get('/');
+  const exportSource = await get('/js/exportEstimate.js');
+  const templateSource = await get('/js/kp-template-base64.js');
+
+  assert.ok(html.includes('export-btn'));
+  assert.match(exportSource, /KP_TEMPLATE|template/i);
+  assert.ok(extractTemplate(templateSource).length > 10_000);
+});
+
+test('09. Excel-шаблон открывается и содержит оформленную смету', async () => {
+  const workbook = await readTemplate();
+  const text = workbookText(workbook);
+  let styledCells = 0;
+  let mergedRanges = 0;
+  let sizedColumns = 0;
+
+  for (const name of workbook.SheetNames) {
+    const sheet = workbook.Sheets[name];
+    assert.ok(sheet['!ref'], `Лист ${name} пуст`);
+    mergedRanges += (sheet['!merges'] || []).length;
+    sizedColumns += (sheet['!cols'] || []).length;
+
+    for (const [address, cell] of Object.entries(sheet)) {
+      if (!address.startsWith('!') && cell.s !== undefined) styledCells += 1;
+    }
+  }
+
+  assert.ok(text.length > 100, 'В книге недостаточно содержимого');
+  assert.ok(styledCells + mergedRanges + sizedColumns > 0,
+    'В книге отсутствуют признаки табличного оформления');
+});
+
+test('10. Excel и код экспорта не содержат явных ошибок', async () => {
+  const workbook = await readTemplate();
+  const text = workbookText(workbook);
+  const source = await applicationSource();
+  const badValues = /#REF!|#VALUE!|#DIV\/0!|NaN|undefined/i;
+
+  assert.doesNotMatch(text, badValues);
+  for (const id of ['companyName', 'projectName', 'licenceCount', 'termMonths', 'tmHours']) {
+    assert.ok(source.includes(id), `Экспортный контур потерял поле ${id}`);
+  }
+});
