@@ -1,0 +1,40 @@
+# Название проверки во вкладке Actions
+name: TestQuest Tests
+
+# Когда запускать тесты
+on:
+  push:
+    branches:
+      - main
+      - testquest-tests
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Разрешаем только чтение репозитория
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      # Скачиваем код репозитория
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Устанавливаем Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # Запускаем тесты
+      - name: Run TestQuest tests
+        env:
+          BASE_URL: https://testquest.pryaniky.com
+        run: bash run-tests.sh
